@@ -71,7 +71,7 @@ OUTPUT_TEMP=$(mktemp)
 	--csa-channel 14 \
 	-e "${SSID}" \
 	${WI_IFACE2} \
-	2>&1 > ${OUTPUT_TEMP}
+	> ${OUTPUT_TEMP} 2>&1
 
 # Wait a second
 sleep 2
@@ -80,14 +80,33 @@ sleep 2
 kill_tcpdump
 
 CSA_PATTERN=2503010e00
+# One burst submits 64 frames; same-interface monitor capture sees each
+# injection and its transmitted copy, for 128 observations.
 #"type mgt subtype beacon and wlan addr3 ${AP_MAC}" - add AP_MAC lookup
-AMOUNT_PACKETS=$(tcpdump -r ${TEMP_TCPDUMP_PCAP} -x "type mgt subtype beacon" 2>/dev/null | tr -d ' '| ${GREP} -c "${CSA_PATTERN}" )
+AMOUNT_PACKETS=$(tcpdump -r ${TEMP_TCPDUMP_PCAP} -x "type mgt subtype beacon" 2>/dev/null | tr -d '[:space:]' | ${GREP} -o "${CSA_PATTERN}" | wc -l)
 
 # There should be exactly 128 csa total
 RET=0
-if [ ${AMOUNT_PACKETS} -ne 128 ]; then
+if [ "${AMOUNT_PACKETS:-0}" -ne 128 ]; then
 	RET=1
-	echo "Expected 128 csa beacon frames, got ${AMOUNT_PACKETS_CLIENT}"
+	echo "Expected 128 csa beacon observations, got ${AMOUNT_PACKETS}"
+fi
+
+# A zero count runs continuously; SIGINT should stop cleanly between frames.
+"${abs_builddir}/../aireplay-ng${EXEEXT}" \
+	--csa 0 \
+	--csa-channel 14 \
+	-e "${SSID}" \
+	${WI_IFACE2} \
+	> ${OUTPUT_TEMP} 2>&1 &
+CSA_PID=$!
+sleep 1
+kill -INT "${CSA_PID}"
+wait "${CSA_PID}"
+CSA_STATUS=$?
+if [ ${CSA_STATUS} -ne 0 ]; then
+	RET=1
+	echo "CSA attack did not stop cleanly after SIGINT"
 fi
 
 exit ${RET}
