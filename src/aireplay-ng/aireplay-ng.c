@@ -75,6 +75,7 @@
 #include "aircrack-ng/support/common.h"
 #include "aircrack-ng/utf8/verifyssid.h"
 #include "aircrack-ng/tui/console.h"
+#include "csa.h"
 
 #define RTC_RESOLUTION 8192
 
@@ -126,46 +127,7 @@ extern struct wif * _wi_in;
 extern struct wif * _wi_out;
 extern uint8_t h80211[4096];
 
-static int strip_tag(uint8_t * tagged_params,
-					 size_t * tp_length,
-					 const uint8_t exclude_tag_id)
-{
-	size_t dst_pos = 0, src_pos = 0;
-
-	if (tagged_params == NULL || tp_length == NULL) return (-1);
-	if (*tp_length == 0) return (0);
-
-	while (src_pos < *tp_length)
-	{
-		uint8_t cur_tag_id;
-		uint8_t cur_tag_length;
-		size_t cur_tag_total_len;
-
-		if (src_pos + 2 > *tp_length) return (-1);
-
-		cur_tag_id = tagged_params[src_pos];
-		cur_tag_length = tagged_params[src_pos + 1];
-		cur_tag_total_len = (size_t) cur_tag_length + 2;
-
-		if (src_pos + cur_tag_total_len > *tp_length) return (-1);
-
-		if (cur_tag_id != exclude_tag_id)
-		{
-			if (src_pos != dst_pos)
-			{
-				memmove(tagged_params + dst_pos,
-						tagged_params + src_pos,
-						cur_tag_total_len);
-			}
-			dst_pos += cur_tag_total_len;
-		}
-
-		src_pos += cur_tag_total_len;
-	}
-
-	*tp_length = dst_pos;
-	return (0);
-}
+static volatile sig_atomic_t ctrl_c;
 
 static unsigned char * find_tag_data(unsigned char * tagged_params,
 									 const size_t tagged_len,
@@ -177,12 +139,15 @@ static unsigned char * find_tag_data(unsigned char * tagged_params,
 	if (tagged_params == NULL || value_len == NULL) return (NULL);
 	if (tagged_len < 2) return (NULL);
 
-	while (pos + 2 <= tagged_len)
+	while (pos < tagged_len)
 	{
-		size_t cur_len = tagged_params[pos + 1];
-		size_t cur_total_len = cur_len + 2;
+		size_t cur_len;
+		size_t cur_total_len;
 
-		if (pos + cur_total_len > tagged_len) return (NULL);
+		if (tagged_len - pos < 2) return (NULL);
+		cur_len = tagged_params[pos + 1];
+		cur_total_len = cur_len + 2;
+		if (cur_total_len > tagged_len - pos) return (NULL);
 		if (tagged_params[pos] == tag_id)
 		{
 			*value_len = cur_len;
@@ -209,6 +174,8 @@ static int capture_target_beacon(uint8_t * beacon, size_t * beacon_len)
 
 	while (1)
 	{
+		if (ctrl_c) return (-1);
+
 		gettimeofday(&now_tv, NULL);
 		if (((now_tv.tv_sec - start_tv.tv_sec) * 1000000L
 			 + (now_tv.tv_usec - start_tv.tv_usec))
@@ -263,36 +230,6 @@ static int capture_target_beacon(uint8_t * beacon, size_t * beacon_len)
 		*beacon_len = (size_t) caplen;
 		return (0);
 	}
-}
-
-static int build_csa_beacon(uint8_t * beacon, size_t * beacon_len)
-{
-	struct ieee80211_csa_ie csa;
-	size_t tagged_len;
-
-	REQUIRE(beacon != NULL);
-	REQUIRE(beacon_len != NULL);
-
-	if (*beacon_len < 36) return (-1);
-
-	tagged_len = *beacon_len - 36;
-	if (strip_tag(beacon + 36, &tagged_len, IEEE80211_ELEMID_CSA) != 0)
-	{
-		return (-1);
-	}
-
-	csa.csa_ie = IEEE80211_ELEMID_CSA;
-	csa.csa_len = 3;
-	csa.csa_mode = 1;
-	csa.csa_newchan = opt.csa_channel;
-	csa.csa_count = 0;
-
-	if ((36 + tagged_len + sizeof(csa)) > 4096) return (-1);
-
-	memcpy(beacon + 36 + tagged_len, &csa, sizeof(csa));
-	*beacon_len = 36 + tagged_len + sizeof(csa);
-
-	return (0);
 }
 
 static const char usage[] =
@@ -417,7 +354,7 @@ static const unsigned char ska_auth3[4096]
 	= "\xb0\x40\x3a\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 	  "\x00\x00\x00\x00\x00\x00\xc0\x01";
 
-static int ctrl_c, alarmed;
+static volatile sig_atomic_t alarmed;
 
 static void sighandler(int signum)
 {
@@ -768,14 +705,58 @@ static int do_attack_csa(void)
 		return (EXIT_FAILURE);
 	}
 
+	{
+		int input_channel = wi_get_channel(_wi_in);
+		int output_channel = wi_get_channel(_wi_out);
+		int channel_status
+			= csa_check_channels(input_channel,
+							 output_channel,
+							 opt.ignore_negative_one);
+
+		if (channel_status == CSA_CHANNEL_UNKNOWN_ALLOWED)
+		{
+			printf("Warning: unable to verify that capture and injection "
+				   "interfaces are on the same channel.\n");
+		}
+		else if (channel_status == CSA_CHANNEL_MISMATCH)
+		{
+			if (input_channel == -1 || output_channel == -1)
+			{
+				printf("Unable to determine the capture or injection interface "
+					   "channel; use --ignore-negative-one to continue.\n");
+			}
+			else
+			{
+				printf("Capture interface is on channel %d, but injection "
+					   "interface is on channel %d.\n",
+					   input_channel,
+					   output_channel);
+			}
+			return (EXIT_FAILURE);
+		}
+	}
+
+	ctrl_c = 0;
+	if (signal(SIGINT, sighandler) == SIG_ERR)
+	{
+		perror("signal(SIGINT)");
+		return (EXIT_FAILURE);
+	}
+
 	beacon_len = sizeof(h80211);
 	if (capture_target_beacon(h80211, &beacon_len) != 0)
 	{
+		if (ctrl_c) return (EXIT_SUCCESS);
 		printf("Unable to capture a matching beacon frame.\n");
 		return (EXIT_FAILURE);
 	}
 
-	if (build_csa_beacon(h80211, &beacon_len) != 0)
+	if (csa_build_beacon(h80211,
+					  &beacon_len,
+					  sizeof(h80211),
+					  IEEE80211_ELEMID_CSA,
+					  opt.csa_channel)
+		!= 0)
 	{
 		printf("Unable to build CSA beacon frame.\n");
 		return (EXIT_FAILURE);
@@ -783,11 +764,12 @@ static int do_attack_csa(void)
 
 	n = 0;
 
-	while (1)
+	while (!ctrl_c)
 	{
 		if (opt.a_count > 0 && ++n > opt.a_count) break;
 
 		usleep(180000);
+		if (ctrl_c) break;
 
 		PCT;
 		printf("Sending CSA beacon (channel %u). BSSID:"
@@ -800,7 +782,7 @@ static int do_attack_csa(void)
 			   opt.r_bssid[4],
 			   opt.r_bssid[5]);
 
-		for (i = 0; i < CSA_BURST_SIZE; i++)
+		for (i = 0; i < CSA_BURST_SIZE && !ctrl_c; i++)
 		{
 			if (send_packet(_wi_out,
 							h80211,
@@ -808,6 +790,7 @@ static int do_attack_csa(void)
 							kRewriteSequenceNumber)
 				< 0)
 			{
+				if (ctrl_c) break;
 				return (EXIT_FAILURE);
 			}
 
